@@ -279,7 +279,16 @@ def _render_end_turn_photo_widget(game: GameState) -> None:
 # change on its own; uploading a photo is what ends the turn)
 # ---------------------------------------------------------------------------
 def screen_timer_running(game: GameState):
-    st_autorefresh(interval=1000, key="timer_tick")
+    photo_key = f"camera_{game.turn_number}_{game.photo_attempt}"
+    photo_already_selected = st.session_state.get(photo_key) is not None
+
+    # Once a photo has been chosen, DON'T keep autorefreshing -- OCR on a
+    # 15x15 board can easily take longer than the 1s refresh interval, and
+    # if the timer fires again before it finishes, Streamlit kills that
+    # run and restarts the whole script, so OCR keeps getting interrupted
+    # and never actually completes.
+    if not photo_already_selected:
+        st_autorefresh(interval=1000, key="timer_tick")
 
     player = game.current_player()
     st.title(f"{player.name}'s turn")
@@ -469,7 +478,11 @@ def screen_camera_waiting(game: GameState | None):
 # the control device's timer screen: just the countdown and the uploader.
 # ---------------------------------------------------------------------------
 def screen_camera_turn_active(game: GameState):
-    st_autorefresh(interval=1000, key="camera_timer_tick")
+    photo_key = f"camera_{game.turn_number}_{game.photo_attempt}"
+    photo_already_selected = st.session_state.get(photo_key) is not None
+
+    if not photo_already_selected:
+        st_autorefresh(interval=1000, key="camera_timer_tick")
 
     player = game.current_player()
     st.title(f"{player.name}'s turn")
