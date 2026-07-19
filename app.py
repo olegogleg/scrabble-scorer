@@ -24,11 +24,6 @@ from scrabble.persistence import save_game, load_game, autosave_exists, delete_a
 
 st.set_page_config(page_title="Scrabble Scorer", layout="centered")
 
-# Phases where the CAMERA device is the one that should be acting.
-# Every other phase is the CONTROL device's job.
-CAMERA_ACTIVE_PHASES = {Phase.CAPTURE_PHOTO}
-
-
 def _persist(game: GameState) -> None:
     """Write the current game to disk so the other device (and a reload) can pick it up."""
     save_game(game)
@@ -250,7 +245,38 @@ def screen_turn_start(game: GameState):
 
 
 # ---------------------------------------------------------------------------
-# TIMER RUNNING (control device; soft reminder - never forces the phase change)
+# Shared: the uploader that ends a turn the moment a photo comes in.
+# Used by both the control device's rich timer screen and the camera
+# device's lean one.
+# ---------------------------------------------------------------------------
+def _render_end_turn_photo_widget(game: GameState) -> None:
+    st.caption(
+        "Taking or choosing a picture ends your turn automatically -- no separate button needed. "
+        "Choose \"Take Photo\" to use your phone's actual camera app (zoom, flash, etc.) "
+        "instead of an in-page preview."
+    )
+    photo = st.file_uploader(
+        "Take or choose a picture of the board",
+        type=["jpg", "jpeg", "png", "heic", "heif"],
+        accept_multiple_files=False,
+        key=f"camera_{game.turn_number}_{game.photo_attempt}",
+    )
+
+    if photo is not None:
+        with st.spinner("Reading the board..."):
+            fresh_board = read_board_from_image(photo)
+
+        # Trust the previously confirmed board for squares that were
+        # already occupied; only take fresh OCR for newly-placed tiles.
+        game.pending_board = merge_with_history(game.board, fresh_board)
+        game.phase = Phase.CONFIRM_BOARD
+        _persist(game)
+        st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# TIMER RUNNING (control device; soft reminder - never forces the phase
+# change on its own; uploading a photo is what ends the turn)
 # ---------------------------------------------------------------------------
 def screen_timer_running(game: GameState):
     st_autorefresh(interval=1000, key="timer_tick")
@@ -267,47 +293,15 @@ def screen_timer_running(game: GameState):
     else:
         overtime = int(-remaining)
         mins, secs = divmod(overtime, 60)
-        st.error(f"Time's up! ({mins:02d}:{secs:02d} over) - finish whenever you're ready.")
+        st.error(f"Time's up! ({mins:02d}:{secs:02d} over) - take your photo whenever you're ready.")
 
     target_end_timestamp = game.turn_start_time + game.turn_duration_sec
     render_timer_sound_widget(
         target_end_timestamp, game.sound_choice, game.sound_repeat, game.sound_repeat_interval_sec
     )
 
-    if st.button("End turn / take photo", type="primary", use_container_width=True):
-        game.phase = Phase.CAPTURE_PHOTO
-        game.photo_attempt += 1
-        _persist(game)
-        st.rerun()
-
-
-# ---------------------------------------------------------------------------
-# CAPTURE PHOTO -- this is the CAMERA device's screen when two devices
-# are in play; the control device shows a waiting screen instead (below).
-# ---------------------------------------------------------------------------
-def screen_capture_photo(game: GameState):
-    st.title("Photograph the board")
-    st.caption(
-        "Tap below and choose \"Take Photo\" to use your phone's actual camera app "
-        "(with zoom, flash, etc.) instead of an in-page preview."
-    )
-    photo = st.file_uploader(
-        "Take or choose a picture of the current board",
-        type=["jpg", "jpeg", "png", "heic", "heif"],
-        accept_multiple_files=False,
-        key=f"camera_{game.turn_number}_{game.photo_attempt}",
-    )
-
-    if photo is not None:
-        with st.spinner("Reading the board..."):
-            fresh_board = read_board_from_image(photo)
-
-        # Trust the previously confirmed board for squares that were
-        # already occupied; only take fresh OCR for newly-placed tiles.
-        game.pending_board = merge_with_history(game.board, fresh_board)
-        game.phase = Phase.CONFIRM_BOARD
-        _persist(game)
-        st.rerun()
+    st.divider()
+    _render_end_turn_photo_widget(game)
 
 
 # ---------------------------------------------------------------------------
@@ -343,7 +337,7 @@ def screen_confirm_board(game: GameState):
 
     if col2.button("Retake photo", use_container_width=True):
         game.pending_board = None
-        game.phase = Phase.CAPTURE_PHOTO
+        game.phase = Phase.TIMER_RUNNING
         game.photo_attempt += 1
         _persist(game)
         st.rerun()
@@ -443,7 +437,7 @@ def screen_game_over(game: GameState):
 
 # ---------------------------------------------------------------------------
 # CAMERA-DEVICE waiting screen (shown whenever it's NOT the camera's turn
-# to act -- i.e. every phase except CAPTURE_PHOTO)
+# to act -- i.e. every phase except TIMER_RUNNING)
 # ---------------------------------------------------------------------------
 def screen_camera_waiting(game: GameState | None):
     st.title("Scrabble Camera")
@@ -457,8 +451,6 @@ def screen_camera_waiting(game: GameState | None):
     player = game.current_player()
     if game.phase == Phase.TURN_START:
         st.info(f"Waiting for {player.name} to start their turn.")
-    elif game.phase == Phase.TIMER_RUNNING:
-        st.info(f"{player.name} is playing their turn. You'll be asked for a photo when they're done.")
     elif game.phase == Phase.CONFIRM_BOARD:
         st.info("Photo received -- being confirmed on the main screen now.")
     elif game.phase == Phase.SCORING_DONE:
@@ -472,19 +464,28 @@ def screen_camera_waiting(game: GameState | None):
 
 
 # ---------------------------------------------------------------------------
-# CONTROL-DEVICE waiting-for-photo screen (shown while CAPTURE_PHOTO is
-# in progress on the camera device). Includes a fallback so this device
-# can take the photo itself if there's no second device available.
+# CAMERA-DEVICE active screen -- shown during TIMER_RUNNING, since taking
+# the photo (which ends the turn) is this device's job. Lean version of
+# the control device's timer screen: just the countdown and the uploader.
 # ---------------------------------------------------------------------------
-def screen_control_waiting_for_photo(game: GameState):
-    render_sidebar(game)
-    player = game.current_player()
-    st.title("Waiting for the photo")
-    st_autorefresh(interval=1500, key="control_wait_tick")
-    st.info(f"Take a picture of the board on the camera device now, {player.name}.")
+def screen_camera_turn_active(game: GameState):
+    st_autorefresh(interval=1000, key="camera_timer_tick")
 
-    with st.expander("No second device? Take the photo here instead"):
-        screen_capture_photo(game)
+    player = game.current_player()
+    st.title(f"{player.name}'s turn")
+
+    elapsed = time.time() - game.turn_start_time
+    remaining = game.turn_duration_sec - elapsed
+    if remaining > 0:
+        mins, secs = divmod(int(remaining), 60)
+        st.metric("Time left", f"{mins:02d}:{secs:02d}")
+    else:
+        overtime = int(-remaining)
+        mins, secs = divmod(overtime, 60)
+        st.warning(f"Time's up! ({mins:02d}:{secs:02d} over) - take the photo whenever ready.")
+
+    _render_end_turn_photo_widget(game)
+    render_switch_role_button()
 
 
 # ---------------------------------------------------------------------------
@@ -495,8 +496,6 @@ if st.session_state.device_role is None:
 elif st.session_state.device_role == "control":
     if game is None:
         screen_setup()
-    elif game.phase in CAMERA_ACTIVE_PHASES:
-        screen_control_waiting_for_photo(game)
     else:
         render_sidebar(game)
         {
@@ -515,7 +514,7 @@ else:  # camera role
             st.rerun()
         else:
             screen_camera_waiting(None)
-    elif game.phase in CAMERA_ACTIVE_PHASES:
-        screen_capture_photo(game)
+    elif game.phase == Phase.TIMER_RUNNING:
+        screen_camera_turn_active(game)
     else:
         screen_camera_waiting(game)

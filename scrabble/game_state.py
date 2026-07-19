@@ -15,7 +15,6 @@ class Phase(Enum):
     SETUP = auto()
     TURN_START = auto()
     TIMER_RUNNING = auto()
-    CAPTURE_PHOTO = auto()
     CONFIRM_BOARD = auto()   # editing AND blank-resolution both happen here
     SCORING_DONE = auto()
     GAME_OVER = auto()

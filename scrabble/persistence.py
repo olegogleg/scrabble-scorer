@@ -73,11 +73,15 @@ def load_game(path: str = AUTOSAVE_PATH) -> GameState:
         np.array(data["pending_board"], dtype="<U4") if data["pending_board"] is not None else None
     )
 
+    saved_phase_name = data["phase"]
+    if saved_phase_name == "CAPTURE_PHOTO":  # removed phase from an older version of this app
+        saved_phase_name = "TIMER_RUNNING"
+
     return GameState(
         players=players,
         current_idx=data["current_idx"],
         turn_duration_sec=data["turn_duration_sec"],
-        phase=Phase[data["phase"]],
+        phase=Phase[saved_phase_name],
         board=board,
         pending_board=pending_board,
         photo_attempt=data["photo_attempt"],
