@@ -223,6 +223,7 @@ def screen_setup():
 # TURN START (control device)
 # ---------------------------------------------------------------------------
 def screen_turn_start(game: GameState):
+    st_autorefresh(interval=2000, key="turn_start_tick")
     player = game.current_player()
     st.title(f"{player.name}'s turn")
     st.caption(f"Turn timer: {game.turn_duration_sec}s (soft limit - it won't cut you off)")
@@ -286,8 +287,14 @@ def screen_timer_running(game: GameState):
 # ---------------------------------------------------------------------------
 def screen_capture_photo(game: GameState):
     st.title("Photograph the board")
-    photo = st.camera_input(
-        "Take a picture of the current board",
+    st.caption(
+        "Tap below and choose \"Take Photo\" to use your phone's actual camera app "
+        "(with zoom, flash, etc.) instead of an in-page preview."
+    )
+    photo = st.file_uploader(
+        "Take or choose a picture of the current board",
+        type=["jpg", "jpeg", "png", "heic", "heif"],
+        accept_multiple_files=False,
         key=f"camera_{game.turn_number}_{game.photo_attempt}",
     )
 
@@ -346,6 +353,7 @@ def screen_confirm_board(game: GameState):
 # SCORING DONE (control device)
 # ---------------------------------------------------------------------------
 def screen_scoring_done(game: GameState):
+    st_autorefresh(interval=2000, key="scoring_done_tick")
     player = game.current_player()
 
     if "_scored" not in st.session_state:
@@ -405,6 +413,7 @@ def screen_scoring_done(game: GameState):
 # GAME OVER (control device)
 # ---------------------------------------------------------------------------
 def screen_game_over(game: GameState):
+    st_autorefresh(interval=2000, key="game_over_tick")
     st.title("Game over")
 
     max_score = max(p.score for p in game.players)
