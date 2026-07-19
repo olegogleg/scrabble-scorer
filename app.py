@@ -1,5 +1,12 @@
 """
 Scrabble game runner. Run with:  streamlit run app.py
+
+Two devices can now share one game: open this same URL on both, pick
+"Main screen" on one (timer, scoreboard, board confirmation, everything
+except the camera) and "Camera only" on the other (just takes the photo
+each turn). Both stay in sync via the same autosave file on disk --
+whichever device made the most recent move, the other one picks it up
+within a couple of seconds automatically.
 """
 
 import time
@@ -12,28 +19,73 @@ from scrabble.game_state import GameState, Player, Phase, advance_to_next_player
 from scrabble.board_reader import read_board_from_image, merge_with_history, build_score_baseline
 from scrabble.board_display import board_to_display_df, parse_display_df, UNRESOLVED_BLANK_GLYPH
 from scrabble.scorer import calculate_turn_score, format_breakdown
-from scrabble.sound import play_timer_sound, SOUND_OPTIONS
+from scrabble.sound import render_timer_sound_widget, SOUND_OPTIONS
 from scrabble.persistence import save_game, load_game, autosave_exists, delete_autosave
 
 st.set_page_config(page_title="Scrabble Scorer", layout="centered")
 
+# Phases where the CAMERA device is the one that should be acting.
+# Every other phase is the CONTROL device's job.
+CAMERA_ACTIVE_PHASES = {Phase.CAPTURE_PHOTO}
+
 
 def _persist(game: GameState) -> None:
-    """Write the current game to disk so a reload can resume it."""
+    """Write the current game to disk so the other device (and a reload) can pick it up."""
     save_game(game)
 
 
 # ---------------------------------------------------------------------------
-# Session bootstrap
+# Device role: chosen once per browser/device, kept in THIS session only
+# (never written to the shared save file -- it's a property of the
+# device, not of the game).
 # ---------------------------------------------------------------------------
+def screen_choose_role():
+    st.title("Scrabble Scorer")
+    st.write("How will you use this device?")
+    c1, c2 = st.columns(2)
+    if c1.button("Main screen", use_container_width=True, type="primary"):
+        st.session_state.device_role = "control"
+        st.rerun()
+    if c2.button("Camera only", use_container_width=True):
+        st.session_state.device_role = "camera"
+        st.rerun()
+    st.caption(
+        "Main screen: timer, scoreboard, confirming the board, everything except "
+        "the photo. Camera only: just takes the picture each turn -- use this on "
+        "the phone if you're playing with two devices."
+    )
+
+
+def render_switch_role_button():
+    if st.button("Switch this device's role"):
+        st.session_state.device_role = None
+        st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Session bootstrap + cross-device sync
+# ---------------------------------------------------------------------------
+if "device_role" not in st.session_state:
+    st.session_state.device_role = None
 if "game" not in st.session_state:
     st.session_state.game = None
 
 game: GameState | None = st.session_state.game
 
+# If we already have a local game in memory, check whether the OTHER
+# device has moved things forward (different phase or turn number on
+# disk) -- if so, adopt the disk copy. If nothing changed, keep using
+# our own in-memory copy so we don't disturb any in-progress typing.
+if game is not None and autosave_exists():
+    disk_game = load_game()
+    if (disk_game.turn_number, disk_game.phase.value) != (game.turn_number, game.phase.value):
+        game = disk_game
+        st.session_state.game = game
+
 
 # ---------------------------------------------------------------------------
 # Always-visible sidebar: scoreboard + top words + turn history + end game
+# (control device only -- the camera device's screen stays minimal)
 # ---------------------------------------------------------------------------
 def render_sidebar(game: GameState) -> None:
     with st.sidebar:
@@ -96,9 +148,12 @@ def render_sidebar(game: GameState) -> None:
                 st.session_state["confirm_end_game"] = False
                 st.rerun()
 
+        st.divider()
+        render_switch_role_button()
+
 
 # ---------------------------------------------------------------------------
-# SETUP
+# SETUP (control device only)
 # ---------------------------------------------------------------------------
 def screen_setup():
     st.title("Scrabble Scorer")
@@ -116,33 +171,37 @@ def screen_setup():
 
     st.subheader("Game setup")
 
+    # Number of players lives OUTSIDE the form below so the name fields
+    # update immediately as you change it, instead of waiting for a submit.
     n = st.number_input("Number of players", min_value=2, max_value=4, value=2, step=1)
-    names = []
-    for i in range(n):
-        names.append(st.text_input(f"Player {i + 1} name", value=f"Player {i + 1}", key=f"name_{i}"))
 
-    starter = st.selectbox("Who goes first?", names)
-    duration = st.number_input("Turn timer (seconds)", min_value=10, value=180, step=10)
-    rack_size = st.number_input(
-        f"Letters per turn (for the +{ALL_TILES_BONUS_POINTS}-point all-letters bonus)",
-        min_value=2, max_value=12, value=7, step=1,
-    )
+    with st.form("setup_form"):
+        names = []
+        for i in range(n):
+            names.append(st.text_input(f"Player {i + 1} name", value=f"Player {i + 1}", key=f"name_{i}"))
 
-    st.subheader("Timer sound")
-    sound_choice = st.selectbox(
-        "Sound when time is up",
-        options=list(SOUND_OPTIONS.keys()),
-        format_func=lambda k: SOUND_OPTIONS[k],
-        index=list(SOUND_OPTIONS.keys()).index("alarm"),
-    )
-    sound_repeat = st.checkbox("Repeat the sound until I end the turn", value=True)
-    sound_repeat_interval = 3
-    if sound_repeat:
-        sound_repeat_interval = st.number_input(
-            "Repeat every how many seconds", min_value=2, value=3, step=1
+        starter = st.selectbox("Who goes first?", names)
+        duration = st.number_input("Turn timer (seconds)", min_value=10, value=180, step=10)
+        rack_size = st.number_input(
+            f"Letters per turn (for the +{ALL_TILES_BONUS_POINTS}-point all-letters bonus)",
+            min_value=2, max_value=12, value=7, step=1,
         )
 
-    if st.button("Start game", type="primary"):
+        st.subheader("Timer sound")
+        sound_choice = st.selectbox(
+            "Sound when time is up",
+            options=list(SOUND_OPTIONS.keys()),
+            format_func=lambda k: SOUND_OPTIONS[k],
+            index=list(SOUND_OPTIONS.keys()).index("alarm"),
+        )
+        sound_repeat = st.checkbox("Repeat the sound until I end the turn", value=True)
+        sound_repeat_interval = st.number_input(
+            "Repeat every how many seconds (if repeating)", min_value=2, value=3, step=1
+        )
+
+        submitted = st.form_submit_button("Start game", type="primary")
+
+    if submitted:
         if len(set(names)) != len(names):
             st.error("Player names must be unique.")
             return
@@ -161,7 +220,7 @@ def screen_setup():
 
 
 # ---------------------------------------------------------------------------
-# TURN START
+# TURN START (control device)
 # ---------------------------------------------------------------------------
 def screen_turn_start(game: GameState):
     player = game.current_player()
@@ -190,7 +249,7 @@ def screen_turn_start(game: GameState):
 
 
 # ---------------------------------------------------------------------------
-# TIMER RUNNING (soft reminder - never forces the phase change)
+# TIMER RUNNING (control device; soft reminder - never forces the phase change)
 # ---------------------------------------------------------------------------
 def screen_timer_running(game: GameState):
     st_autorefresh(interval=1000, key="timer_tick")
@@ -209,14 +268,10 @@ def screen_timer_running(game: GameState):
         mins, secs = divmod(overtime, 60)
         st.error(f"Time's up! ({mins:02d}:{secs:02d} over) - finish whenever you're ready.")
 
-        if game.sound_choice != "none":
-            if not game.sound_repeat:
-                if overtime == 0:
-                    play_timer_sound(game.sound_choice, nonce="once")
-            else:
-                interval = max(1, game.sound_repeat_interval_sec)
-                if overtime % interval == 0:
-                    play_timer_sound(game.sound_choice, nonce=str(overtime))
+    target_end_timestamp = game.turn_start_time + game.turn_duration_sec
+    render_timer_sound_widget(
+        target_end_timestamp, game.sound_choice, game.sound_repeat, game.sound_repeat_interval_sec
+    )
 
     if st.button("End turn / take photo", type="primary", use_container_width=True):
         game.phase = Phase.CAPTURE_PHOTO
@@ -226,7 +281,8 @@ def screen_timer_running(game: GameState):
 
 
 # ---------------------------------------------------------------------------
-# CAPTURE PHOTO
+# CAPTURE PHOTO -- this is the CAMERA device's screen when two devices
+# are in play; the control device shows a waiting screen instead (below).
 # ---------------------------------------------------------------------------
 def screen_capture_photo(game: GameState):
     st.title("Photograph the board")
@@ -248,7 +304,8 @@ def screen_capture_photo(game: GameState):
 
 
 # ---------------------------------------------------------------------------
-# CONFIRM BOARD (editable grid; blanks resolved here too; retake option)
+# CONFIRM BOARD (control device; editable grid; blanks resolved here too;
+# retake option)
 # ---------------------------------------------------------------------------
 def screen_confirm_board(game: GameState):
     st.title("Confirm the board")
@@ -286,7 +343,7 @@ def screen_confirm_board(game: GameState):
 
 
 # ---------------------------------------------------------------------------
-# SCORING DONE
+# SCORING DONE (control device)
 # ---------------------------------------------------------------------------
 def screen_scoring_done(game: GameState):
     player = game.current_player()
@@ -345,7 +402,7 @@ def screen_scoring_done(game: GameState):
 
 
 # ---------------------------------------------------------------------------
-# GAME OVER
+# GAME OVER (control device)
 # ---------------------------------------------------------------------------
 def screen_game_over(game: GameState):
     st.title("Game over")
@@ -376,17 +433,80 @@ def screen_game_over(game: GameState):
 
 
 # ---------------------------------------------------------------------------
+# CAMERA-DEVICE waiting screen (shown whenever it's NOT the camera's turn
+# to act -- i.e. every phase except CAPTURE_PHOTO)
+# ---------------------------------------------------------------------------
+def screen_camera_waiting(game: GameState | None):
+    st.title("Scrabble Camera")
+    st_autorefresh(interval=1500, key="camera_wait_tick")
+
+    if game is None:
+        st.info("Waiting for a game to be started on the main screen...")
+        render_switch_role_button()
+        return
+
+    player = game.current_player()
+    if game.phase == Phase.TURN_START:
+        st.info(f"Waiting for {player.name} to start their turn.")
+    elif game.phase == Phase.TIMER_RUNNING:
+        st.info(f"{player.name} is playing their turn. You'll be asked for a photo when they're done.")
+    elif game.phase == Phase.CONFIRM_BOARD:
+        st.info("Photo received -- being confirmed on the main screen now.")
+    elif game.phase == Phase.SCORING_DONE:
+        st.info("Scoring this turn on the main screen.")
+    elif game.phase == Phase.GAME_OVER:
+        st.success("Game over! Check the main screen for the winner.")
+    else:
+        st.info("Waiting...")
+
+    render_switch_role_button()
+
+
+# ---------------------------------------------------------------------------
+# CONTROL-DEVICE waiting-for-photo screen (shown while CAPTURE_PHOTO is
+# in progress on the camera device). Includes a fallback so this device
+# can take the photo itself if there's no second device available.
+# ---------------------------------------------------------------------------
+def screen_control_waiting_for_photo(game: GameState):
+    render_sidebar(game)
+    player = game.current_player()
+    st.title("Waiting for the photo")
+    st_autorefresh(interval=1500, key="control_wait_tick")
+    st.info(f"Take a picture of the board on the camera device now, {player.name}.")
+
+    with st.expander("No second device? Take the photo here instead"):
+        screen_capture_photo(game)
+
+
+# ---------------------------------------------------------------------------
 # Router
 # ---------------------------------------------------------------------------
-if game is None:
-    screen_setup()
-else:
-    render_sidebar(game)
-    {
-        Phase.TURN_START: screen_turn_start,
-        Phase.TIMER_RUNNING: screen_timer_running,
-        Phase.CAPTURE_PHOTO: screen_capture_photo,
-        Phase.CONFIRM_BOARD: screen_confirm_board,
-        Phase.SCORING_DONE: screen_scoring_done,
-        Phase.GAME_OVER: screen_game_over,
-    }[game.phase](game)
+if st.session_state.device_role is None:
+    screen_choose_role()
+elif st.session_state.device_role == "control":
+    if game is None:
+        screen_setup()
+    elif game.phase in CAMERA_ACTIVE_PHASES:
+        screen_control_waiting_for_photo(game)
+    else:
+        render_sidebar(game)
+        {
+            Phase.TURN_START: screen_turn_start,
+            Phase.TIMER_RUNNING: screen_timer_running,
+            Phase.CONFIRM_BOARD: screen_confirm_board,
+            Phase.SCORING_DONE: screen_scoring_done,
+            Phase.GAME_OVER: screen_game_over,
+        }[game.phase](game)
+else:  # camera role
+    if game is None:
+        if autosave_exists():
+            # A game may already be under way (started on the control
+            # device) -- adopt it directly, no prompt needed here.
+            st.session_state.game = load_game()
+            st.rerun()
+        else:
+            screen_camera_waiting(None)
+    elif game.phase in CAMERA_ACTIVE_PHASES:
+        screen_capture_photo(game)
+    else:
+        screen_camera_waiting(game)
